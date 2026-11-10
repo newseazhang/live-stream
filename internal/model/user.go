@@ -3,11 +3,26 @@ package model
 import "time"
 
 type User struct {
-	UserID       uint64    `json:"user_id" gorm:"primaryKey;autoIncrement"`
-	UserName     string    `json:"user_name" mapstructure:"user_name" gorm:"size:32;uniqueIndex:idx_users_username;not null"`
-	UserEmail    string    `json:"user_email" mapstructure:"email" gorm:"size:254;uniqueIndex:idx_users_email;not null"`
-	PasswordHash string    `json:"-" mapstructure:"-" gorm:"size:255;not null"`
-	AvatarURL    string    `json:"avatar_url" mapstructure:"avatar_url" gorm:"size:512"`
-	CreatedAt    time.Time `json:"created_at" mapstructure:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" mapstructure:"updated_at"`
+	UserID       int64     `orm:"column(user_id);pk;auto" json:"user_id"` //   `pk` = primary key 主键。
+	UserName     string    `orm:"column(user_name);size(32);unique" json:"user_name"`
+	Email        string    `orm:"size(254);unique" json:"email"`
+	PasswordHash string    `orm:"size(255)" json:"-"`
+	CreatedAt    time.Time `orm:"auto_now_add;type(datetime)" json:"created_at"`
+	UpdatedAt    time.Time `orm:"auto_now;type(datetime)" json:"updated_at"`
 }
+
+func (u *User) TableName() string {
+	return "users"
+}
+
+/*
+| Go 字段 | 数据库列 | 用途 |
+|---|---|---|
+| `UserID` | `user_id` | 自增主键 |
+| `UserName` | `user_name` | 用户名，要求唯一 |
+| `Email` | `email` | 邮箱，要求唯一 |
+| `PasswordHash` | `password_hash` | 保存密码哈希 |
+| `CreatedAt` | `created_at` | 创建时间 |
+| `UpdatedAt` | `updated_at` | 更新时间 |
+
+*/

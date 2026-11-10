@@ -4,96 +4,69 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"live-stream/internal/dao"
-	"live-stream/internal/model"
+	"example.com/live-stream/internal/model"
 
-	"gorm.io/gorm"
+	"github.com/beego/beego/v2/client/orm"
+
+	"modernc.org/sqlite"
+
+	"modernc.org/sqlite/lib"
 )
 
+var ErrUserConflict = errors.New("用户名或邮箱已注册")
+
+// CreateUser 将用户写入数据库，并返回带有自增主键的用户。 //拒绝重复注册
 func CreateUser(ctx context.Context, user *model.User) (*model.User, error) {
-	// err := gorm.G[model.User](dao.SC.Db).Create(ctx, user)
-	// if err != nil {
-	// 	panic(fmt.Errorf("创建用户失败: %w", err))
-	// }
-	results := gorm.WithResult()
-	err := gorm.G[model.User](dao.SC.Db, results).Create(ctx, user)
-	if err != nil {
-		return nil, fmt.Errorf("fatal error create user: %w", err)
+	if user == nil {
+		return nil, errors.New("创建用户时必须提供用户对象")
 	}
-	if results.RowsAffected == 0 {
-		return nil, fmt.Errorf("no rows inserted")
-	}
+	// NewOrm 每次拿到的是一个新 ORM 实例，不是协程安全的，适合单次操作。
+
+	if _, err := orm.NewOrm().InsertWithCtx(ctx, user); err != nil {
+
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return nil, fmt.Errorf("%w: %w", ErrUserConflict, err)
+		}
+		return nil, fmt.Errorf("创建用户失败: %w", err)
+	} // InsertWithCtx（）返回值为affectedRows int64, err error 第一个是受影响的行数，插入成功后 user中的自增id会回填到结构体中
+
 	return user, nil
 }
 
-func DeleteUser(ctx context.Context, user *model.User) error {
-	rowsaffected, err := gorm.G[model.User](dao.SC.Db).Where("user_id = ? AND user_name = ?", user.UserID, user.UserName).Delete(ctx)
-	if err != nil {
-		return fmt.Errorf("fatal error delete user: %w", err)
-	}
-	if rowsaffected != 0 {
-		return nil
-	} else {
-		return fmt.Errorf("no record found, id: %v, name: %v", user.UserID, user.UserName)
-	}
+// FindUserByEmail 按邮箱查找用户。查无记录时返回 nil, nil。
+func FindUserByEmail(ctx context.Context, email string) (*model.User, error) {
+	user := &model.User{Email: email}
 
-}
-
-func UpdateUser(ctx context.Context, user *model.User) error {
-	rowsaffected, err := gorm.G[model.User](dao.SC.Db).Where("user_id = ?", user.UserID).Update(ctx, "user_name", user.UserName)
-	if err != nil {
-		return fmt.Errorf("fatal error update user: %w", err)
-	}
-	if rowsaffected != 0 {
-		return nil
-	} else {
-		return fmt.Errorf("no record found, id: %v, name: %v", user.UserID, user.UserName)
-	}
-}
-
-func SelectUsers(ctx context.Context, user *model.User) ([]model.User, error) {
-
-	users, err := gorm.G[model.User](dao.SC.Db).Where("user_name LIKE ?", "%"+user.UserName+"%").Find(ctx)
-
-	if err != nil {
-		return nil, fmt.Errorf("fatal error select user: %w", err)
-	}
-
-	return users, nil
-}
-
-func SelectUser(ctx context.Context, user *model.User) (*model.User, error) {
-
-	resuser, err := gorm.G[model.User](dao.SC.Db).Where("user_id = ?", user.UserID).First(ctx)
-
-	if err != nil {
-		return nil, fmt.Errorf("fatal error select user: %w", err)
-	}
-
-	return &resuser, nil
-}
-
-func SelectUserByEmail(ctx context.Context, user *model.User) (*model.User, error) {
-
-	resuser, err := gorm.G[model.User](dao.SC.Db).Where("user_email = ?", user.UserEmail).First(ctx)
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	err := orm.NewOrm().ReadWithCtx(ctx, user, "Email")
+	if errors.Is(err, orm.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("fatal error select user: %w", err)
+		return nil, fmt.Errorf("按邮箱查询用户失败: %w", err)
 	}
 
-	return &resuser, nil
+	return user, nil
 }
 
-func SelectUserByUserID(ctx context.Context, userID uint64) (*model.User, error) {
+func FindUserByID(ctx context.Context,userid int64) (*model.User ,error){
 
-	resuser, err := gorm.G[model.User](dao.SC.Db).Where("user_id = ?", userID).First(ctx)
+	user := &model.User{UserID: userid}
 
+
+	err := orm.NewOrm().ReadWithCtx(ctx,user)
+	
+    if errors.Is(err, orm.ErrNoRows) {
+        return nil, nil
+    }
 	if err != nil {
-		return nil, fmt.Errorf("fatal error select user: %w", err)
-	}
+        return nil, fmt.Errorf("按 ID 查询用户失败: %w", err)
+    }
 
-	return &resuser, nil
+	return user,nil
 }
+
+
+
+
+

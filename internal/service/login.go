@@ -4,53 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"live-stream/internal/auth"
-	"live-stream/internal/model"
-	"live-stream/internal/repo"
-	"log"
+	"strings"
+
+	"example.com/live-stream/internal/model"
+	"example.com/live-stream/internal/repo"
+
+	"github.com/alexedwards/argon2id"
 )
 
-var ErrInvalidCredentials = errors.New("the email or password is wrong")
+var ErrInvalidCredentials = errors.New("邮箱或密码错误")
 
-func UserLogin(ctx context.Context, loginRequest *model.LoginRequest) (*model.User, string, error) {
-	if loginRequest == nil {
-		return nil, "", errors.New("the email is not registered")
+func LoginUser(ctx context.Context, email, password string) (*model.User, error) {
+	// 沿用注册时的邮箱处理规则。
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || password == "" {
+		return nil, ErrInvalidCredentials
 	}
 
-	var user model.User
-	user = model.User{
-		UserEmail: loginRequest.UserEmail,
-	}
-
-	reuser, err := repo.SelectUserByEmail(ctx, &user)
+	user, err := repo.FindUserByEmail(ctx, email)
 	if err != nil {
-		log.Printf("login failed: %v", err)
-		return nil, "", fmt.Errorf("select user by email: %w", err)
+		return nil, fmt.Errorf("查询登录用户失败: %w", err)
 	}
-	if reuser == nil {
-		return nil, "", ErrInvalidCredentials
+	if user == nil {
+		return nil, ErrInvalidCredentials
 	}
-	match, err := VerifyPassword(loginRequest.Password, reuser.PasswordHash)
+
+	// 使用数据库里保存的哈希验证用户输入的密码。
+	match, err := argon2id.ComparePasswordAndHash(password, user.PasswordHash)
 	if err != nil {
-		log.Printf("verify password failed: %v", err)
-		return nil, "", fmt.Errorf("verify password: %w", err)
+		return nil, fmt.Errorf("校验密码哈希失败: %w", err)
 	}
 	if !match {
-		return nil, "", ErrInvalidCredentials
-	}
-	// 生成会话token
-	token, err := auth.GenSessionToken()
-	if err != nil {
-		log.Printf("generate session token failed: %v", err)
-		return nil, "", fmt.Errorf("gen token: %w", err)
+		return nil, ErrInvalidCredentials
 	}
 
-	// value存用户ID
-	err = auth.StoreSession(ctx, token, reuser.UserID)
-	if err != nil {
-		log.Printf("redis save session failed: %v", err)
-		return nil, "", fmt.Errorf("save session: %w", err)
-	}
-
-	return reuser, token, nil
+	return user, nil
 }

@@ -3,141 +3,90 @@ package service
 import (
 	"context"
 	"errors"
-	"live-stream/internal/config"
-	"live-stream/internal/model"
-	"live-stream/internal/repo"
-	"log"
+	"strings"
+	"unicode/utf8"
+
+	"example.com/live-stream/internal/model"
+	"example.com/live-stream/internal/repo"
 )
 
-var ErrInvalidOwnerID = errors.New("user already has a room")
-var ErrInvalidRoomID = errors.New("room is not exist")
-var ErrNotRoomOwner = errors.New("only room owner can operate")
+var (
+	ErrInvalidRoomTitle  = errors.New("房间标题须为 1–120 个字符")
+	ErrRoomAlreadyExists = errors.New("当前账号已有房间")
+	ErrRoomNotFound = errors.New("房间不存在")
+)
 
-func CreateRoom(c context.Context, ownerID uint64, req *model.CreateRoomRequest) (*model.Room, error) {
-	if req == nil {
-		return nil, errors.New("create room request is nil")
+func CreateRoom(ctx context.Context, ownerID int64, title string) (*model.Room, error) {
+	title = strings.TrimSpace(title)
+
+	if title == "" || utf8.RuneCountInString(title) > 120 {
+		return nil, ErrInvalidRoomTitle
 	}
-	var room model.Room
-	room = model.Room{
+
+	room := &model.Room{
 		OwnerID:   ownerID,
-		RoomTitle: req.Title,
-		Status:    0,
-	}
-	// 查询用户ID是否拥有房间
-	resroom, err := repo.SelectRoomByOwnerID(c, ownerID)
-	if err != nil {
-		log.Printf("create room failed: %v", err)
-		return nil, err
-	}
-	// 如果该用户ID已经创建过房间
-	if resroom != nil {
-		return nil, ErrInvalidOwnerID
-	}
-	newRoom, err := repo.CreateRoom(c, &room)
-	if err != nil {
-		log.Printf("create room failed: %v", err)
-		return nil, err
-	}
-	return newRoom, nil
-}
-
-func ListRooms(c context.Context) ([]model.HotRoomDTO, error) {
-	var rooms []model.HotRoomDTO
-	limit := config.GlobalConfig.StreamList.Count
-	if limit <= 0 {
-		limit = 20
-	}
-	rooms, err := repo.SelectRankedRooms(c, limit)
-	if err != nil {
-		log.Printf("list rooms failed: %v", err)
-		return nil, err
-	}
-	return rooms, nil
-}
-
-func GetRoomByOwnerID(ctx context.Context, ownerID uint64) (*model.Room, error) {
-	return repo.SelectRoomByOwnerID(ctx, ownerID)
-}
-
-func RoomDetail(c context.Context, roomID uint64) (*model.RoomDetail, error) {
-	detail, err := repo.SelectRoomDetail(c, roomID)
-	if err != nil {
-		log.Printf("room detail failed: %v", err)
-		return nil, err
-	}
-	return &detail, nil
-}
-
-func UpdateRoom(c context.Context, updateReq *model.UpdateRoomRequest, loginID uint64, roomID uint64) (*model.Room, error) {
-	if updateReq == nil {
-		return nil, errors.New("update room request is nil")
-	}
-	room, err := repo.SelectRoomByRoomID(c, roomID)
-	if err != nil {
-		log.Printf("room update failed: %v", err)
-		return nil, err
-	}
-	if room == nil {
-		return nil, ErrInvalidRoomID
-	}
-	// 房主权限校验
-	if room.OwnerID != loginID {
-		return nil, ErrNotRoomOwner
-	}
-	roomTitle := updateReq.RoomTitle
-	err = repo.UpdateRoom(c, roomID, roomTitle)
-	if err != nil {
-		log.Printf("room update failed: %v", err)
-		return nil, err
-	}
-	room, err = repo.SelectRoomByRoomID(c, roomID)
-	if err != nil {
-		log.Printf("room update failed: %v", err)
-		return nil, err
+		RoomTitle: title,
+		Status:    model.RoomStatusOffline,
 	}
 
+	err := repo.InsertRoom(ctx, room)
+	if errors.Is(err, repo.ErrRoomOwnerConflict) {
+		return nil, ErrRoomAlreadyExists
+	}
+	if err != nil {
+		return nil, err
+	}
 	return room, nil
-
 }
 
-func StartLiveService(ctx context.Context, roomID uint64, title string, loginID uint64) error {
-	// 当前房间必须是未开播0，不能重复开播
-	room, err := repo.SelectRoomByRoomID(ctx, roomID)
+// 按登录用户 ID 查询，直接调用 Repository。
+func GetMyRoom(ctx context.Context, ownerID int64) (*model.Room, error) {
+	return repo.FindRoomByOwnerID(ctx, ownerID)
+}
+
+//房间详情
+func GetRoomDetail(ctx context.Context, roomID int64) (*model.Room, error) {
+	room, err := repo.FindRoomByID(ctx, roomID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if room == nil {
-		return ErrInvalidRoomID
+		return nil, ErrRoomNotFound
 	}
-	// 房主权限校验
-	if room.OwnerID != loginID {
-		return ErrNotRoomOwner
-	}
-	if room.Status != 0 {
-		return errors.New("room is already live")
-	}
-	return repo.StartLive(ctx, roomID, title)
+	return room, nil
 }
 
-func StopLiveService(ctx context.Context, roomID uint64, loginID uint64) error {
-	room, err := repo.SelectRoomByRoomID(ctx, roomID)
+const publicRoomLimit = 20
+
+func ListRooms(ctx context.Context) ([]model.Room, error) {
+	return repo.ListLiveRooms(ctx, publicRoomLimit)
+}
+
+
+
+//开播
+var (
+	ErrNotRoomOwner = errors.New("只有房主可以操作房间")
+	ErrCannotStart  = errors.New("房间当前无法开播")
+)
+
+func StartRoom(ctx context.Context, roomID, userID int64) error {
+	started, err := repo.StartRoom(ctx, roomID, userID)
 	if err != nil {
 		return err
 	}
-	if room == nil {
-		return ErrInvalidRoomID
+	if started {
+		return nil
 	}
-	// 房主权限校验
-	if room.OwnerID != loginID {
-		return ErrNotRoomOwner
-	}
-	if room.Status != 1 {
-		return errors.New("room is already live")
-	}
-	err = repo.StopLive(ctx, roomID)
+
+	room, err := GetRoomDetail(ctx, roomID)
 	if err != nil {
 		return err
 	}
-
-	return nil
+	if room.OwnerID != userID {
+		return ErrNotRoomOwner
+	}
+	return ErrCannotStart
 }
+
+

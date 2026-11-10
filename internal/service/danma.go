@@ -1,75 +1,41 @@
 package service
 
 import (
-	"context"
-	"live-stream/internal/dao"
-	"live-stream/internal/model"
-	"live-stream/internal/repo"
-	"log"
+	"errors"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
-func GetDanmaHistory(ctx context.Context, roomID uint64, cursor uint64, limit int) (*model.MessageCursorDTO, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 100 {
-		limit = 100
-	}
+var (
+	ErrInvalidDanmaID      = errors.New("message_id 必须是有效的非零 UUID")
+	ErrInvalidDanmaContent = errors.New("弹幕内容须为 1–200 个字符")
+)
 
-	danmas, err := repo.SelectMessageByCursor(ctx, roomID, cursor, limit+1)
-	if err != nil {
-		log.Printf("get danmas history failed: %v", err)
-		return nil, err
-	}
-	hasMore := len(danmas) > limit
-	if hasMore {
-		danmas = danmas[:limit]
-	}
-
-	var nextCursor uint64
-	if hasMore && len(danmas) > 0 {
-		nextCursor = danmas[len(danmas)-1].ID
-	}
-	return &model.MessageCursorDTO{
-		Items:      danmas,
-		NextCursor: nextCursor,
-		HasMore:    hasMore,
-	}, nil
+type DanmaInput struct {
+	MessageID string
+	Content   string
 }
 
-func ReplayDanmaHistory(ctx context.Context, roomID, afterSeq uint64, limit int) (*model.MessageReplayDTO, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 500 {
-		limit = 500
+// 主要是校验弹幕信息合法性
+func ValidateDanma(input DanmaInput) (DanmaInput, error) {
+	// 校验 MessageID：必须是合法UUID
+	id, err := uuid.Parse(input.MessageID)
+	if err != nil || id == uuid.Nil {
+		return DanmaInput{}, ErrInvalidDanmaID
 	}
 
-	messages, covered, cacheErr := dao.SelectRecentDanmasAfterSeq(ctx, roomID, afterSeq, limit+1)
-	source := "redis"
-	if cacheErr != nil {
-		log.Printf("read recent danmaku cache failed, fallback to mysql: %v", cacheErr)
+	// 处理弹幕内容：去掉首尾空白
+	content := strings.TrimSpace(input.Content)
+
+	// 校验：不能为空，且字符数量不能超过200个（按utf8字符，不是字节）
+	if content == "" || utf8.RuneCountInString(content) > 200 {
+		return DanmaInput{}, ErrInvalidDanmaContent
 	}
-	if cacheErr != nil || !covered {
-		var err error
-		messages, err = repo.SelectMessagesAfterSeq(ctx, roomID, afterSeq, limit+1)
-		if err != nil {
-			return nil, err
-		}
-		source = "mysql"
-	}
-	hasMore := len(messages) > limit
-	if hasMore {
-		messages = messages[:limit]
-	}
-	nextSeq := afterSeq
-	if len(messages) > 0 {
-		nextSeq = messages[len(messages)-1].RoomSeq
-	}
-	return &model.MessageReplayDTO{
-		Items:   messages,
-		NextSeq: nextSeq,
-		HasMore: hasMore,
-		Source:  source,
+
+	return DanmaInput{
+		MessageID: id.String(),
+		Content:   content,
 	}, nil
 }

@@ -2,526 +2,230 @@ package ws
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"live-stream/internal/model"
-	"log"
-	"runtime"
 	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-type Room struct {
-	clients     map[*Client]bool // 房间内的连接集合
-	shards      [fanoutShardCount]map[*Client]bool
-	onlineUsers map[uint64]uint64 // 房间内的用户在线计数（同账号多端累加）
-	likeCount   int64
-	policy      roomAdaptiveState
-	mu          sync.RWMutex // 读房间级读写锁，仅保护本房间数据
-}
-
-const fanoutShardCount = 16
-
-type fanoutJob struct {
-	roomID  uint64
-	shard   int
-	frame   *websocket.PreparedMessage
-	roomSeq uint64
-	hot     bool
-}
-
 type Hub struct {
-	rooms           map[uint64]*Room // 全局房间字典， 房间ID -> 房间实例
-	broadcastQueues []chan fanoutJob // 同一房间的客户端分片映射到固定 worker
-	register        chan *Client     // 新连接入房
-	unregister      chan *Client     // 连接退出
-	mu              sync.Mutex       // 全局锁，仅保护rooms字典的增删
-	ctx             context.Context
-	cancel          context.CancelFunc
-	workerNum       int
-	presenceMu      sync.Mutex
-	presenceDirty   map[uint64]struct{}
-	presencePeriod  time.Duration
-	adaptive        adaptiveSettings
-	metrics         hubMetrics
+	mu           sync.Mutex
+	rooms        map[int64]*roomGroup
+	closing      bool
+	active       sync.WaitGroup
+	shutdownOnce sync.Once
+	stopped      chan struct{}
+	fanoutQueues [fanoutShardCount]chan fanoutJob
+	fanoutStop   chan struct{}
+	fanoutWG     sync.WaitGroup
+}
+
+type roomGroup struct {
+	// clients / shardCounts 由 Hub.mu 保护，供注册、计数和私有发送使用。
+	clients      map[*Client]uint64
+	nextClientID uint64
+	shardCounts  [fanoutShardCount]int
+	shards       [fanoutShardCount]clientShard
+	broadcastMu  sync.Mutex
 }
 
 func NewHub() *Hub {
-	return newHub(runtime.NumCPU() * 2)
+	h := &Hub{
+		rooms:      make(map[int64]*roomGroup),
+		stopped:    make(chan struct{}),
+		fanoutStop: make(chan struct{}),
+	}
+	h.startFanout()
+	return h
 }
 
-func newHub(workerNum int) *Hub {
-	if workerNum < 1 {
-		workerNum = 1
+func newRoomGroup() *roomGroup {
+	room := &roomGroup{clients: make(map[*Client]uint64)}
+	for i := range room.shards {
+		room.shards[i].clients = make(map[*Client]uint64)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	queues := make([]chan fanoutJob, workerNum)
-	for i := range queues {
-		queues[i] = make(chan fanoutJob, 4096)
-	}
-	return &Hub{
-		rooms:           make(map[uint64]*Room),
-		broadcastQueues: queues,
-		register:        make(chan *Client, 512),
-		unregister:      make(chan *Client, 512),
-		ctx:             ctx,
-		cancel:          cancel,
-		workerNum:       workerNum,
-		presenceDirty:   make(map[uint64]struct{}),
-		presencePeriod:  250 * time.Millisecond,
-		adaptive:        loadAdaptiveSettings(),
-	}
+	return room
 }
 
-func (h *Hub) Stop() {
-	h.cancel()
-}
-
-// SnapshotOnlineCounts 返回此网关中每个本地活跃房间的当前连接数。
-// 热度排行协程会将该快照作为实例级短期在线心跳发布到 Redis。
-func (h *Hub) SnapshotOnlineCounts() map[uint64]int {
+// SnapshotOnlineCounts 返回独立快照；同账号多页面和游客都按连接计数。
+func (h *Hub) SnapshotOnlineCounts() map[int64]int {
 	h.mu.Lock()
-	rooms := make(map[uint64]*Room, len(h.rooms))
-	for roomID, room := range h.rooms {
-		rooms[roomID] = room
+	defer h.mu.Unlock()
+	counts := make(map[int64]int, len(h.rooms))
+	if h.closing {
+		return counts
 	}
-	h.mu.Unlock()
-
-	counts := make(map[uint64]int, len(rooms))
-	for roomID, room := range rooms {
-		room.mu.RLock()
+	for roomID, room := range h.rooms {
 		counts[roomID] = len(room.clients)
-		room.mu.RUnlock()
 	}
 	return counts
 }
 
-func (h *Hub) broadcastWorker(queue <-chan fanoutJob) {
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case job := <-queue:
-			startedAt := time.Now()
-			h.broadcastToShard(job.roomID, job.shard, job.frame, job.roomSeq, job.hot)
-			h.metrics.fanoutShardDuration.observe(time.Since(startedAt))
-		}
-	}
-}
-
-func (h *Hub) enqueueBroadcast(msg Message) {
-	startedAt := time.Now()
-	deliver, changedPolicy := h.planDanmaDelivery(msg, startedAt)
-	if changedPolicy != nil {
-		h.broadcastDeliveryPolicy(*changedPolicy)
-	}
-	if !deliver {
-		h.metrics.sampledMessagesTotal.Add(1)
-		return
-	}
-	frame, err := prepareMessage(&msg)
-	if err != nil {
-		log.Printf("prepare websocket broadcast failed: %v", err)
-		return
-	}
-	h.metrics.broadcastMessagesTotal.Add(1)
-	defer func() {
-		h.metrics.broadcastDuration.observe(time.Since(startedAt))
-	}()
-
-	// 房间按连接而不是按消息分片。每个“房间+分片”组合始终由同一个
-	// FIFO worker 消费，因此同一客户端不会遇到两个 worker 竞争入队
-	// 不同房间消息的情况。
-	hot := h.roomIsHot(msg.RoomID)
-	for shard := 0; shard < fanoutShardCount; shard++ {
-		queue := h.broadcastQueues[h.broadcastQueueIndex(msg.RoomID, shard)]
-		select {
-		case queue <- fanoutJob{
-			roomID:  msg.RoomID,
-			shard:   shard,
-			frame:   frame,
-			roomSeq: msg.RoomSeq,
-			hot:     hot,
-		}:
-		case <-h.ctx.Done():
-			return
-		}
-	}
-}
-
-func (h *Hub) broadcastQueueIndex(roomID uint64, shard int) int {
-	return int((roomID*fanoutShardCount + uint64(shard)) % uint64(len(h.broadcastQueues)))
-}
-
-func (h *Hub) Run() {
-	for _, queue := range h.broadcastQueues {
-		go h.broadcastWorker(queue)
-	}
-	go h.presenceWorker()
-	go h.metricsWorker()
-
-	log.Printf("hub started, workerNum=%d", h.workerNum)
-	for {
-		select {
-		case <-h.ctx.Done():
-			log.Println("hub exit signal received, stop run")
-			return
-		case client := <-h.register:
-			h.handleRegister(client)
-		case client := <-h.unregister:
-			h.handleUnregister(client)
-		}
-	}
-
-}
-
-func (h *Hub) handleRegister(client *Client) {
+func (h *Hub) Add(client *Client) bool {
 	h.mu.Lock()
-	room, ok := h.rooms[client.RoomID]
-	// 如果房间不存在该客户端，则初始化
-	if !ok {
-		room = &Room{
-			clients:     make(map[*Client]bool),
-			onlineUsers: make(map[uint64]uint64),
-			likeCount:   client.initialLikeCount,
-		}
-		for shard := range room.shards {
-			room.shards[shard] = make(map[*Client]bool)
-		}
+	if h.closing {
+		h.mu.Unlock()
+		client.Close()
+		return false
+	}
+	room := h.rooms[client.RoomID]
+	if room == nil {
+		room = newRoomGroup()
 		h.rooms[client.RoomID] = room
 	}
-	room.mu.Lock()
-	var currentPolicy *deliveryPolicySnapshot
-	if _, exists := room.clients[client]; !exists {
-		room.clients[client] = true
-		room.shards[client.fanoutShard][client] = true
-		room.onlineUsers[client.UserID]++
-		h.metrics.connections.Add(1)
-		if room.policy.sampleStride > 1 {
-			currentPolicy = &deliveryPolicySnapshot{
-				roomID:       client.RoomID,
-				hot:          room.policy.hot,
-				sourceQPS:    room.policy.sourceQPS,
-				fanoutQPS:    room.policy.fanoutQPS,
-				sampleStride: room.policy.sampleStride,
-				latestSeq:    room.policy.latestSeq,
-			}
+	if _, exists := room.clients[client]; exists {
+		h.mu.Unlock()
+		return true
+	}
+	// 使用连接序号分片，同账号和游客的多个连接也能分散到不同 worker。
+	room.nextClientID++
+	clientID := room.nextClientID
+	index := clientShardIndex(clientID)
+	shard := &room.shards[index]
+	shard.mu.Lock()
+	room.clients[client] = clientID
+	room.shardCounts[index]++
+	shard.clients[client] = clientID
+	shard.mu.Unlock()
+	// 与 closing 的检查共用同一把锁；停止后不能再增加等待计数。
+	h.active.Add(1)
+	h.mu.Unlock()
+
+	// 跨实例在线数由 RoomBus 定期汇总并发送，本地成员变更不发布局部总数。
+	return true
+}
+
+func (h *Hub) Remove(client *Client) {
+	removed := false
+	h.mu.Lock()
+	if room := h.rooms[client.RoomID]; room != nil {
+		if clientID, exists := room.clients[client]; exists {
+			index := clientShardIndex(clientID)
+			shard := &room.shards[index]
+			shard.mu.Lock()
+			delete(room.clients, client)
+			delete(shard.clients, client)
+			room.shardCounts[index]--
+			shard.mu.Unlock()
+			removed = true
+		}
+		if len(room.clients) == 0 {
+			delete(h.rooms, client.RoomID)
 		}
 	}
-	room.mu.Unlock()
 	h.mu.Unlock()
-	if currentPolicy != nil {
-		h.enqueueDeliveryPolicy(client, *currentPolicy)
+	client.Close()
+
+	if removed {
+		h.active.Done()
 	}
-	h.markPresenceDirty(client.RoomID)
 }
 
-func (h *Hub) handleUnregister(client *Client) {
-	h.mu.Lock()
-	room, ok := h.rooms[client.RoomID]
-	if !ok {
-		h.mu.Unlock()
-		client.closeSend()
-		return
-	}
-
-	room.mu.Lock()
-	if _, exists := room.clients[client]; !exists {
-		room.mu.Unlock()
-		h.mu.Unlock()
-		client.closeSend()
-		return
-	}
-	delete(room.clients, client)
-	delete(room.shards[client.fanoutShard], client)
-	h.metrics.connections.Add(-1)
-	h.metrics.closedClientsTotal.Add(1)
-	room.onlineUsers[client.UserID]--
-	if room.onlineUsers[client.UserID] <= 0 {
-		delete(room.onlineUsers, client.UserID)
-	}
-	clientCount := len(room.clients)
-	client.closeSend()
-	if clientCount == 0 {
-		delete(h.rooms, client.RoomID)
-	}
-	room.mu.Unlock()
-	h.mu.Unlock()
-	h.markPresenceDirty(client.RoomID)
-}
-
-// markPresenceDirty 仅保存每个房间最新的待处理状态。因此，短时间内集中发生的
-// 加入/离开事件在每个周期只会产生一次在线状态更新，而不会为每次连接事件
-// 都触发一次全房间广播。
-func (h *Hub) markPresenceDirty(roomID uint64) {
-	h.presenceMu.Lock()
-	h.presenceDirty[roomID] = struct{}{}
-	h.presenceMu.Unlock()
-}
-
-func (h *Hub) takeDirtyRooms() []uint64 {
-	h.presenceMu.Lock()
-	roomIDs := make([]uint64, 0, len(h.presenceDirty))
-	for roomID := range h.presenceDirty {
-		roomIDs = append(roomIDs, roomID)
-		delete(h.presenceDirty, roomID)
-	}
-	h.presenceMu.Unlock()
-	return roomIDs
-}
-
-func (h *Hub) presenceWorker() {
-	ticker := time.NewTicker(h.presencePeriod)
-	defer ticker.Stop()
+// Broadcast 按房间串行入队，由固定 worker 异步执行各连接分片的投递。
+// 返回表示完成入队，不表示所有 WebSocket 已写出。
+func (h *Hub) Broadcast(message ServerMessage) {
 	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case <-ticker.C:
-			for _, roomID := range h.takeDirtyRooms() {
-				if h.presenceDue(roomID, time.Now()) {
-					h.broadcastOnlineCount(roomID)
-				} else {
-					h.markPresenceDirty(roomID)
-				}
-			}
-		}
-	}
-}
-
-func (h *Hub) broadcastOnlineCount(roomID uint64) {
-	h.mu.Lock()
-	room, ok := h.rooms[roomID]
-	if !ok {
-		h.mu.Unlock()
-		return
-	}
-	room.mu.RLock()
-	h.mu.Unlock()
-	onlineCount := len(room.clients)
-	likeCount := room.likeCount
-	room.mu.RUnlock()
-
-	msg := model.Message{
-		Type:   model.MsgTypeSystem,
-		RoomID: roomID,
-		Data: map[string]interface{}{
-			"sub_type":     "room_state",
-			"online_count": onlineCount,
-			"like_count":   likeCount,
-		},
-	}
-	// 在线状态属于可覆盖的状态更新，因此特意不放入弹幕使用的事件队列。
-	h.broadcastStateToRoom(&msg)
-}
-
-func (h *Hub) handleStateUpdate(msg *Message) {
-	if msg.Data == nil || msg.Data["sub_type"] != "like_count" {
-		return
-	}
-	likeCount, ok := msg.Data["like_count"].(float64)
-	if !ok {
-		return
-	}
-	h.mu.Lock()
-	room, exists := h.rooms[msg.RoomID]
-	if !exists {
-		h.mu.Unlock()
-		return
-	}
-	room.mu.Lock()
-	h.mu.Unlock()
-	room.likeCount = int64(likeCount)
-	room.mu.Unlock()
-	h.broadcastOnlineCount(msg.RoomID)
-}
-
-func (h *Hub) broadcastStateToRoom(msg *Message) {
-	startedAt := time.Now()
-	h.metrics.broadcastMessagesTotal.Add(1)
-	defer func() {
-		h.metrics.broadcastDuration.observe(time.Since(startedAt))
-	}()
-	frame, err := prepareMessage(msg)
-	if err != nil {
-		log.Printf("prepare websocket state broadcast failed: %v", err)
-		return
-	}
-	for shard := 0; shard < fanoutShardCount; shard++ {
 		h.mu.Lock()
-		room, ok := h.rooms[msg.RoomID]
-		if !ok {
+		if h.closing {
 			h.mu.Unlock()
 			return
 		}
-		room.mu.RLock()
+		room := h.rooms[message.RoomID]
 		h.mu.Unlock()
-		clients := make([]*Client, 0, len(room.shards[shard]))
-		for client := range room.shards[shard] {
-			clients = append(clients, client)
-		}
-		room.mu.RUnlock()
-		for _, client := range clients {
-			if client.replaceState(frame) == enqueueOK {
-				h.metrics.deliveryEnqueuedTotal.Add(1)
-			}
-		}
-	}
-}
-
-func (h *Hub) broadcastControlToRoom(msg *Message) {
-	frame, err := prepareMessage(msg)
-	if err != nil {
-		log.Printf("prepare websocket control broadcast failed: %v", err)
-		return
-	}
-	for shard := 0; shard < fanoutShardCount; shard++ {
-		h.mu.Lock()
-		room := h.rooms[msg.RoomID]
 		if room == nil {
-			h.mu.Unlock()
 			return
 		}
-		room.mu.RLock()
-		h.mu.Unlock()
-		clients := make([]*Client, 0, len(room.shards[shard]))
-		for client := range room.shards[shard] {
-			clients = append(clients, client)
+
+		room.broadcastMu.Lock()
+		h.mu.Lock()
+		if h.closing {
+			h.mu.Unlock()
+			room.broadcastMu.Unlock()
+			return
 		}
-		room.mu.RUnlock()
-		for _, client := range clients {
-			if result := client.trySendControl(frame); result == enqueueFull {
-				h.metrics.controlQueueFullTotal.Add(1)
-				client.closeConnectionWithReason(4001, "control_queue_full")
-				client.signalUnregister()
+		// 等待广播锁期间，空房可能已删除并重建；重新取当前分组。
+		if h.rooms[message.RoomID] != room {
+			h.mu.Unlock()
+			room.broadcastMu.Unlock()
+			continue
+		}
+		maxClientID := room.nextClientID
+		counts := room.shardCounts
+		h.mu.Unlock()
+
+		if message.Type == TypeRoomState {
+			// 保留 RoomBus 传入的跨实例计数；点赞状态可以不携带在线数。
+			message.SentAt = time.Now().UTC()
+		}
+		for index, count := range counts {
+			if count == 0 {
+				continue
+			}
+			job := fanoutJob{
+				shard: &room.shards[index], message: message,
+				maxClientID: maxClientID,
+			}
+			select {
+			case h.fanoutQueues[index] <- job:
+			case <-h.fanoutStop:
+				room.broadcastMu.Unlock()
+				return
 			}
 		}
-	}
-}
-
-func (h *Hub) broadcastToRoom(msg *Message) {
-	startedAt := time.Now()
-	h.metrics.broadcastMessagesTotal.Add(1)
-	defer func() {
-		h.metrics.broadcastDuration.observe(time.Since(startedAt))
-	}()
-
-	frame, err := prepareMessage(msg)
-	if err != nil {
-		log.Printf("prepare websocket broadcast failed: %v", err)
+		room.broadcastMu.Unlock()
 		return
 	}
-	for shard := 0; shard < fanoutShardCount; shard++ {
-		h.broadcastToShard(msg.RoomID, shard, frame, msg.RoomSeq, h.roomIsHot(msg.RoomID))
-	}
 }
 
-func prepareMessage(value any) (*websocket.PreparedMessage, error) {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	return websocket.NewPreparedMessage(websocket.TextMessage, data)
-}
-
-func (h *Hub) broadcastToShard(
-	roomID uint64,
-	shard int,
-	frame *websocket.PreparedMessage,
-	roomSeq uint64,
-	hot bool,
-) {
+// SendToUser 给本房间该用户的连接发送私有消息，不执行房间广播。
+func (h *Hub) SendToUser(roomID, userID int64, message ServerMessage) {
 	h.mu.Lock()
-	room, ok := h.rooms[roomID]
-	if !ok {
+	if h.closing {
 		h.mu.Unlock()
 		return
 	}
-	room.mu.RLock()
-	h.mu.Unlock()
-	clients := make([]*Client, 0, len(room.shards[shard]))
-	for client := range room.shards[shard] {
-		clients = append(clients, client)
-	}
-	room.mu.RUnlock()
-
-	for _, client := range clients {
-		h.enqueueClient(client, frame, roomSeq, hot)
-	}
-}
-
-func (h *Hub) enqueueJSON(client *Client, value any) {
-	frame, err := prepareMessage(value)
-	if err != nil {
-		log.Printf("prepare websocket response failed: %v", err)
-		return
-	}
-	if result := client.trySendControl(frame); result == enqueueFull {
-		h.metrics.controlQueueFullTotal.Add(1)
-		client.closeConnectionWithReason(4001, "control_queue_full")
-		client.signalUnregister()
-	}
-}
-
-func (h *Hub) resyncFrame(client *Client, latestSeq uint64) *websocket.PreparedMessage {
-	frame, err := prepareMessage(map[string]any{
-		"type":       "resync_required",
-		"room_id":    client.RoomID,
-		"reason":     "live_queue_gap",
-		"after_seq":  client.lastWrittenSeq.Load(),
-		"latest_seq": latestSeq,
-		"replay_url": fmt.Sprintf("/api/v1/rooms/%d/messages/replay", client.RoomID),
-	})
-	if err != nil {
-		log.Printf("prepare resync control message failed: %v", err)
-		return nil
-	}
-	return frame
-}
-
-func (h *Hub) enqueueClient(
-	client *Client,
-	message *websocket.PreparedMessage,
-	roomSeq uint64,
-	hot bool,
-) {
-	result := client.trySendData(
-		message,
-		roomSeq,
-		hot,
-		h.adaptive.queueHighWatermark,
-	)
-	switch result {
-	case enqueueOK:
-		h.metrics.deliveryEnqueuedTotal.Add(1)
-	case enqueueClosed:
-		// 注销流程已经负责清理已关闭的队列。
-	case enqueueDroppedOldest, enqueueFull:
-		h.metrics.queueFullTotal.Add(1)
-		if result == enqueueDroppedOldest {
-			h.metrics.droppedOldestTotal.Add(1)
-			h.metrics.deliveryEnqueuedTotal.Add(1)
-		}
-		notifyGap, disconnect := client.recordQueuePressure(
-			time.Now(),
-			h.adaptive.slowStrikeLimit,
-			h.adaptive.slowGrace,
-		)
-		if notifyGap {
-			h.metrics.resyncRequiredTotal.Add(1)
-			if frame := h.resyncFrame(client, roomSeq); frame != nil {
-				if result := client.trySendControl(frame); result == enqueueFull {
-					h.metrics.controlQueueFullTotal.Add(1)
-					disconnect = true
-				}
+	clients := make([]*Client, 0)
+	if room := h.rooms[roomID]; room != nil {
+		for client := range room.clients {
+			if client.UserID == userID {
+				clients = append(clients, client)
 			}
 		}
-		if disconnect {
-			h.metrics.slowClientDisconnectTotal.Add(1)
-			client.closeConnectionWithReason(4001, "resync_required")
-			client.signalUnregister()
+	}
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.Send(message)
+	}
+}
+
+// Shutdown 停止接纳新连接，关闭当前连接，等待它们完成清理。
+// ctx 仅限制本次等待，超时后 Hub 仍保持关闭状态。
+func (h *Hub) Shutdown(ctx context.Context) error {
+	h.shutdownOnce.Do(func() {
+		h.mu.Lock()
+		h.closing = true
+		// 队列不关闭；唤醒等待入队的 Broadcast，避免并发发送到已关闭 channel。
+		close(h.fanoutStop)
+		clients := make([]*Client, 0)
+		for _, room := range h.rooms {
+			for client := range room.clients {
+				clients = append(clients, client)
+			}
 		}
+		h.mu.Unlock()
+
+		go func() {
+			for _, client := range clients {
+				client.Close()
+			}
+			h.fanoutWG.Wait()
+			h.active.Wait()
+			close(h.stopped)
+		}()
+	})
+
+	select {
+	case <-h.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

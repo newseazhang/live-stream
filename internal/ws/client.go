@@ -1,582 +1,112 @@
 package ws
 
 import (
-	"live-stream/internal/config"
-	"live-stream/internal/dao"
-	"live-stream/internal/kafka"
-	"live-stream/internal/model"
-	"log"
-	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	writeWait = 10 * time.Second
-	pongWait  = 60 * time.Second
-	// 在常见的 30 秒反向代理/NAT 空闲超时前维持连接活跃。
-	// 浏览器会自动用 Pong 响应 WebSocket Ping 帧。
-	pingPeriod        = 20 * time.Second
-	clientQueueSize   = 256
-	controlQueueSize  = 8
-	gapNoticeInterval = 5 * time.Second
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = 20 * time.Second
+	maxMessageSize = 4096
+	sendQueueSize  = 64
 )
-
-var nextConnectionID atomic.Uint64
-
-type enqueueResult uint8
-
-const (
-	enqueueOK enqueueResult = iota
-	enqueueClosed
-	enqueueFull
-	enqueueDroppedOldest
-)
-
-type outboundFrame struct {
-	message *websocket.PreparedMessage
-	roomSeq uint64
-}
 
 type Client struct {
-	hub              *Hub
-	conn             *websocket.Conn
-	RoomID           uint64                          // 当前客户端所在的房间
-	send             chan outboundFrame              // 下发给前端的消息队列
-	control          chan *websocket.PreparedMessage // accepted/error/resync 等高优先级控制消息
-	state            chan *websocket.PreparedMessage // 在线人数等可覆盖的最新状态
-	UserID           uint64                          // 当前客户端的用户id
-	UserName         string
-	initialLikeCount int64
-	connectionID     uint64
-	fanoutShard      int
+	RoomID int64
+	UserID int64
 
-	sendMu          sync.RWMutex
-	sendClosed      bool
-	unregisterOnce  sync.Once
-	closeOnce       sync.Once
-	closing         atomic.Bool
-	lastAck         atomic.Uint64
-	queueFullStreak atomic.Uint32
-	queueFullSince  atomic.Int64
-	lastGapNotice   atomic.Int64
-	lastWrittenSeq  atomic.Uint64
+	conn      *websocket.Conn
+	send      chan ServerMessage //发送消息队列：WriteLoop协程消费这个channel
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
-func NewClient(
-	hub *Hub,
-	conn *websocket.Conn,
-	roomID uint64,
-	userID uint64,
-	userName string,
-	initialLikeCount ...int64,
-) *Client {
-	connectionID := nextConnectionID.Add(1)
-	likeCount := int64(0)
-	if len(initialLikeCount) > 0 {
-		likeCount = initialLikeCount[0]
-	}
+// 绑定房间和用户 在查到的房间和用户之间建立连接
+func NewClient(conn *websocket.Conn, roomID, userID int64) *Client {
 	return &Client{
-		hub:              hub,
-		conn:             conn,
-		RoomID:           roomID,
-		UserID:           userID,
-		UserName:         userName,
-		initialLikeCount: likeCount,
-		connectionID:     connectionID,
-		fanoutShard:      int(connectionID % fanoutShardCount),
-		send:             make(chan outboundFrame, clientQueueSize),
-		control:          make(chan *websocket.PreparedMessage, controlQueueSize),
-		state:            make(chan *websocket.PreparedMessage, 1),
+		RoomID: roomID,
+		UserID: userID,
+		conn:   conn,
+		send:   make(chan ServerMessage, sendQueueSize),
+		done:   make(chan struct{}), //无缓存 仅作信号标记
 	}
 }
 
-func (c *Client) trySendData(
-	message *websocket.PreparedMessage,
-	roomSeq uint64,
-	preferLatest bool,
-	highWatermark int,
-) enqueueResult {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	if c.sendClosed {
-		return enqueueClosed
-	}
-	frame := outboundFrame{message: message, roomSeq: roomSeq}
-	if preferLatest && highWatermark > 0 && len(c.send) >= highWatermark {
-		select {
-		case <-c.send:
-		default:
-		}
-		select {
-		case c.send <- frame:
-			return enqueueDroppedOldest
-		default:
-			return enqueueFull
-		}
-	}
-	select {
-	case c.send <- frame:
-		if len(c.send) < cap(c.send)/2 && c.queueFullStreak.Load() != 0 {
-			c.queueFullStreak.Store(0)
-			c.queueFullSince.Store(0)
-		}
-		return enqueueOK
-	default:
-		// 队列中包含过期的实时事件。丢弃最旧事件以便客户端尽量接近实时进度，
-		// 然后通知客户端补拉缺失区间。
-		select {
-		case <-c.send:
-		default:
-			return enqueueFull
-		}
-		select {
-		case c.send <- frame:
-			return enqueueDroppedOldest
-		default:
-			return enqueueFull
-		}
-	}
-}
-
-func (c *Client) trySendControl(message *websocket.PreparedMessage) enqueueResult {
-	c.sendMu.RLock()
-	defer c.sendMu.RUnlock()
-	if c.sendClosed {
-		return enqueueClosed
-	}
-	select {
-	case c.control <- message:
-		return enqueueOK
-	default:
-		return enqueueFull
-	}
-}
-
-func (c *Client) replaceState(message *websocket.PreparedMessage) enqueueResult {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	if c.sendClosed {
-		return enqueueClosed
-	}
-	select {
-	case c.state <- message:
-		return enqueueOK
-	default:
-	}
-	// 状态可以覆盖：丢弃旧值，只保留最新值。
-	select {
-	case <-c.state:
-	default:
-	}
-	c.state <- message
-	return enqueueOK
-}
-
-// recordQueueFull 用于区分短时突发流量和持续缓慢的连接。
-// 首次丢弃实时事件时发送一次重新同步提示；只有队列持续处于高水位时
-// 才会关闭套接字。
-func (c *Client) recordQueuePressure(
-	now time.Time,
-	strikeLimit uint32,
-	grace time.Duration,
-) (notifyGap, disconnect bool) {
-	nowNanos := now.UnixNano()
-	if c.queueFullSince.Load() == 0 {
-		c.queueFullSince.CompareAndSwap(0, nowNanos)
-	}
-	streak := c.queueFullStreak.Add(1)
-	for {
-		lastNotice := c.lastGapNotice.Load()
-		if lastNotice != 0 && nowNanos-lastNotice < int64(gapNoticeInterval) {
-			break
-		}
-		if c.lastGapNotice.CompareAndSwap(lastNotice, nowNanos) {
-			notifyGap = true
-			break
-		}
-	}
-	since := c.queueFullSince.Load()
-	disconnect = streak >= strikeLimit || (since > 0 && nowNanos-since >= int64(grace))
-	return notifyGap, disconnect
-}
-
-func (c *Client) closeSend() {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	if c.sendClosed {
-		return
-	}
-	c.sendClosed = true
-	close(c.send)
-	close(c.control)
-	close(c.state)
-}
-
-func (c *Client) signalUnregister() {
-	c.unregisterOnce.Do(func() {
-		select {
-		case c.hub.unregister <- c:
-		case <-c.hub.ctx.Done():
-		}
-	})
-}
-
-func (c *Client) closeConnection() {
-	c.closeConnectionWithReason(0, "")
-}
-
-func (c *Client) closeConnectionWithReason(code int, reason string) {
+func (c *Client) Close() {
 	c.closeOnce.Do(func() {
-		c.closing.Store(true)
-		if c.conn != nil {
-			if code != 0 {
-				_ = c.conn.WriteControl(
-					websocket.CloseMessage,
-					websocket.FormatCloseMessage(code, reason),
-					time.Now().Add(time.Second),
-				)
-			}
-			_ = c.conn.Close()
-		}
+		close(c.done)
+		_ = c.conn.Close()
 	})
 }
 
-func (c *Client) isClosing() bool {
-	return c.closing.Load()
-}
+func (c *Client) Send(message ServerMessage) bool {
 
-func (c *Client) acknowledge(sequence uint64) {
-	for {
-		previous := c.lastAck.Load()
-		if sequence <= previous || c.lastAck.CompareAndSwap(previous, sequence) {
-			return
-		}
+	select {
+	case <-c.done:
+		return false // 连接已经关闭，发送失败
+	case c.send <- message:
+		return true // // 消息成功进入发送队列，等待 WriteLoop 发送
+	default:
+		c.Close() // send队列满了（64条塞满），客户端读消息太慢，判定卡死，直接踢掉
+		return false
 	}
 }
 
-func (c *Client) readPump() {
-	defer func() {
-		c.closeConnection()
-		c.signalUnregister()
-	}()
+// // ReadLoop 持续读取客户端消息；当前由控制器所在的 goroutine 阻塞执行
+func (c *Client) ReadLoop(handle func(ClientMessage)) error {
+	defer c.Close() // 无论什么原因退出读循环，都执行关闭
+	c.conn.SetReadLimit(maxMessageSize)
 
 	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-		log.Printf("websocket set read deadline failed: room_id=%d connection_id=%d err=%v", c.RoomID, c.connectionID, err)
-		return
+		return err
 	}
+
+	//收到客户端pong包时的回调 刷新读超时时间 说明连接还存活
 	c.conn.SetPongHandler(func(string) error {
 		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	for {
-		var msg Message
-		err := c.conn.ReadJSON(&msg)
-		if err != nil {
-			if !c.isClosing() {
-				if closeErr, ok := err.(*websocket.CloseError); ok {
-					log.Printf(
-						"websocket peer closed: room_id=%d connection_id=%d code=%d reason=%q",
-						c.RoomID,
-						c.connectionID,
-						closeErr.Code,
-						closeErr.Text,
-					)
-				} else {
-					log.Printf("websocket read failed: room_id=%d connection_id=%d err=%v", c.RoomID, c.connectionID, err)
-				}
-			}
-			break
+		var message ClientMessage
+		if err := c.conn.ReadJSON(&message); err != nil {
+			return err
 		}
+		handle(message)
 
-		if msg.Type == model.MsgTypeAck {
-			if msg.RoomID != 0 && msg.RoomID != c.RoomID {
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type": "error",
-					"code": http.StatusBadRequest,
-					"msg":  "ACK room_id 与当前房间不一致",
-				})
-				continue
-			}
-			c.acknowledge(msg.AckSeq)
-			c.hub.metrics.ackTotal.Add(1)
-			continue
-		}
-
-		// 匿名用户禁止发送弹幕，直接拦截并返回提示
-		if c.UserID == 0 {
-			c.hub.enqueueJSON(c, map[string]interface{}{
-				"type": "error",
-				"code": http.StatusUnauthorized,
-				"msg":  "登录后才能发送弹幕",
-			})
-			continue
-		}
-
-		if msg.MessageID == "" {
-			msg.MessageID = uuid.NewString()
-		} else {
-			parsedMessageID, parseErr := uuid.Parse(msg.MessageID)
-			if parseErr != nil {
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type": "error",
-					"code": http.StatusBadRequest,
-					"msg":  "message_id 必须是 UUID",
-				})
-				continue
-			}
-			// 将等价的 UUID 写法规范化，避免其绕过 Redis 的
-			// message_id 幂等键。
-			msg.MessageID = parsedMessageID.String()
-		}
-		msg.UserID = c.UserID
-		msg.RoomID = c.RoomID
-		msg.UserName = c.UserName
-
-		if msg.Type == "" {
-			msg.Type = model.MsgTypeDanma
-		}
-		var likeIdentity dao.RoomLikeIdentity
-		likeReserved := false
-		likeAcceptedTTL := 24 * time.Hour
-		hotMetricTTL := 3 * time.Minute
-		hotLikeContributionLimit := 10
-		hotRankingEnabled := false
-		if msg.Type == model.MsgTypeLike {
-			maxPerSecond := 10
-			pendingTTL := time.Minute
-			if config.GlobalConfig != nil {
-				likeConfig := config.GlobalConfig.Danmaku.Like
-				if likeConfig.MaxPerSecond > 0 {
-					maxPerSecond = likeConfig.MaxPerSecond
-				}
-				if likeConfig.ReservationTTLSeconds > 0 {
-					pendingTTL = time.Duration(likeConfig.ReservationTTLSeconds) * time.Second
-				}
-				if likeConfig.IdempotencyTTLSeconds > 0 {
-					likeAcceptedTTL = time.Duration(likeConfig.IdempotencyTTLSeconds) * time.Second
-				}
-				hotConfig := config.GlobalConfig.Danmaku.HotRanking
-				hotRankingEnabled = hotConfig.Enabled
-				if hotConfig.MetricBucketTTLSeconds > 0 {
-					hotMetricTTL = time.Duration(hotConfig.MetricBucketTTLSeconds) * time.Second
-				}
-				if hotConfig.MaxLikeContributionsPerUserMinute > 0 {
-					hotLikeContributionLimit = hotConfig.MaxLikeContributionsPerUserMinute
-				}
-			}
-			likeIdentity = dao.RoomLikeIdentity{
-				MessageID: msg.MessageID,
-				RoomID:    c.RoomID,
-				UserID:    c.UserID,
-			}
-			reservation, limitErr := dao.ReserveRoomLike(
-				c.hub.ctx,
-				likeIdentity,
-				maxPerSecond,
-				pendingTTL,
-			)
-			if limitErr != nil {
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type":       "error",
-					"code":       http.StatusServiceUnavailable,
-					"message_id": msg.MessageID,
-					"msg":        "点赞服务暂时不可用",
-				})
-				continue
-			}
-			switch reservation {
-			case dao.LikeReservationAcquired:
-				likeReserved = true
-			case dao.LikeReservationAccepted:
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type":       model.MsgTypeAccepted,
-					"message_id": msg.MessageID,
-				})
-				continue
-			case dao.LikeReservationRateLimited:
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type":       "error",
-					"code":       http.StatusTooManyRequests,
-					"message_id": msg.MessageID,
-					"msg":        "点赞过于频繁，请稍后再试",
-				})
-				continue
-			case dao.LikeReservationPending:
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type":       "error",
-					"code":       http.StatusConflict,
-					"message_id": msg.MessageID,
-					"msg":        "该点赞正在写入，请稍后使用相同 message_id 重试",
-				})
-				continue
-			default:
-				c.hub.enqueueJSON(c, map[string]interface{}{
-					"type":       "error",
-					"code":       http.StatusBadRequest,
-					"message_id": msg.MessageID,
-					"msg":        "message_id 已被其他点赞请求使用",
-				})
-				continue
-			}
-		}
-
-		err = kafka.SendDanmaMsg(c.hub.ctx, msg)
-		if err != nil {
-			if likeReserved {
-				if releaseErr := dao.ReleaseRoomLikeReservation(c.hub.ctx, likeIdentity); releaseErr != nil {
-					log.Printf("release failed like reservation: %v", releaseErr)
-				}
-			}
-			log.Printf("produce danma to kafka failed: %v", err)
-			c.hub.enqueueJSON(c, map[string]interface{}{
-				"type":       "error",
-				"code":       http.StatusServiceUnavailable,
-				"message_id": msg.MessageID,
-				"msg":        "弹幕暂时发送失败，请使用相同 message_id 重试",
-			})
-			continue
-		}
-		if likeReserved {
-			var confirmErr error
-			if hotRankingEnabled {
-				_, confirmErr = dao.ConfirmRoomLikeAndRecordHotContribution(
-					c.hub.ctx,
-					likeIdentity,
-					likeAcceptedTTL,
-					hotMetricTTL,
-					hotLikeContributionLimit,
-					time.Now(),
-				)
-			} else {
-				confirmErr = dao.ConfirmRoomLike(c.hub.ctx, likeIdentity, likeAcceptedTTL)
-			}
-			if confirmErr != nil {
-				// Kafka 已经完成可靠交接。聚合提交后消费者会修复此 Redis 标记，
-				// 因此不要把 Kafka 已接受的写入报告为点赞失败。
-				log.Printf("confirm accepted like reservation: %v", confirmErr)
-			}
-		}
-		c.hub.enqueueJSON(c, map[string]interface{}{
-			"type":       model.MsgTypeAccepted,
-			"message_id": msg.MessageID,
-		})
 	}
 }
 
-func (c *Client) writePump() {
-	defer func() {
-		c.closeConnection()
-		c.signalUnregister()
-	}()
-	ticker := time.NewTicker(pingPeriod)
+func (c *Client) WriteLoop() error {
+	defer c.Close()
+
+	ticker := time.NewTicker(pingPeriod) //定时器
 	defer ticker.Stop()
-	dataChannel := c.send
-	controlChannel := c.control
-	stateChannel := c.state
 
-	writePrepared := func(message *websocket.PreparedMessage) bool {
-		if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
-			if !c.isClosing() {
-				log.Printf("websocket set write deadline failed: room_id=%d connection_id=%d err=%v", c.RoomID, c.connectionID, err)
-			}
-			return false
-		}
-		if err := c.conn.WritePreparedMessage(message); err != nil {
-			if !c.isClosing() {
-				log.Printf("websocket write failed: room_id=%d connection_id=%d err=%v", c.RoomID, c.connectionID, err)
-			}
-			return false
-		}
-		return true
-	}
-
-	for dataChannel != nil || controlChannel != nil || stateChannel != nil {
-		// 控制消息不能排在数百条过期弹幕后等待。
-		if controlChannel != nil {
-			select {
-			case message, ok := <-controlChannel:
-				if !ok {
-					controlChannel = nil
-					continue
-				}
-				if !writePrepared(message) {
-					if !c.isClosing() {
-						c.hub.metrics.writeErrorsTotal.Add(1)
-					}
-					return
-				}
-				continue
-			default:
-			}
-		}
-		if stateChannel != nil {
-			select {
-			case message, ok := <-stateChannel:
-				if !ok {
-					stateChannel = nil
-					continue
-				}
-				if !writePrepared(message) {
-					if !c.isClosing() {
-						c.hub.metrics.writeErrorsTotal.Add(1)
-					}
-					return
-				}
-				continue
-			default:
-			}
-		}
-
+	for {
 		select {
-		case message, ok := <-controlChannel:
-			if !ok {
-				controlChannel = nil
-				continue
+
+		case <-c.done: //关闭信号遇到
+			return nil
+		case message := <-c.send:
+			//往连接中写信息时 先判断连接是否存活
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				return err
 			}
-			if !writePrepared(message) {
-				if !c.isClosing() {
-					c.hub.metrics.writeErrorsTotal.Add(1)
-				}
-				return
-			}
-		case frame, ok := <-dataChannel:
-			if !ok {
-				dataChannel = nil
-				continue
-			}
-			if !writePrepared(frame.message) {
-				if !c.isClosing() {
-					c.hub.metrics.writeErrorsTotal.Add(1)
-				}
-				return
-			}
-			if frame.roomSeq > 0 {
-				c.lastWrittenSeq.Store(frame.roomSeq)
-			}
-		case message, ok := <-stateChannel:
-			if !ok {
-				stateChannel = nil
-				continue
-			}
-			if !writePrepared(message) {
-				if !c.isClosing() {
-					c.hub.metrics.writeErrorsTotal.Add(1)
-				}
-				return
+			if err := c.conn.WriteJSON(message); err != nil {
+				return err
 			}
 		case <-ticker.C:
-			if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
-				if !c.isClosing() {
-					c.hub.metrics.writeErrorsTotal.Add(1)
-					log.Printf("websocket ping failed: room_id=%d connection_id=%d err=%v", c.RoomID, c.connectionID, err)
-				}
-				return
+			err := c.conn.WriteControl(
+				websocket.PingMessage,
+				nil,
+				time.Now().Add(writeWait),
+			)
+			if err != nil {
+				return err
 			}
 		}
 	}

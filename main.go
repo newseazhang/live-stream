@@ -2,146 +2,144 @@ package main
 
 import (
 	"context"
-	"errors"
-	"live-stream/internal/config"
-	"live-stream/internal/dao"
-	"live-stream/internal/hotrank"
-	"live-stream/internal/kafka"
-	"live-stream/internal/rousters"
-	"live-stream/internal/ws"
 	"log"
-	"net/http"
-	"net/http/pprof"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"example.com/live-stream/internal/kafka"
+	"example.com/live-stream/internal/lifecycle"
+	"example.com/live-stream/internal/service"
+	"example.com/live-stream/internal/storage"
+	"example.com/live-stream/internal/ws"
+	"example.com/live-stream/routers"
+
+	"github.com/beego/beego/v2/server/web"
+	"github.com/beego/beego/v2/server/web/grace"
 )
 
 func main() {
-	config.LoadConfig()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// 1. 选择实例和监听端口。
+	instanceID := os.Getenv("LIVE_INSTANCE_ID")
+	if instanceID == "" {
+		instanceID = "gw-a"
+	}
+	if instanceID != "gw-a" && instanceID != "gw-b" {
+		log.Fatal("LIVE_INSTANCE_ID 只支持 gw-a 或 gw-b")
+	}
+	log.SetPrefix("[" + instanceID + "] ")
 
-	dao.Initdb()
-	dao.InitRedis()
-	reconciledRooms, err := dao.ReconcileRoomLikeCounts(ctx, true)
+	port := 19000
+	if instanceID == "gw-b" {
+		port = 19001
+	}
+	web.BConfig.Listen.HTTPAddr = "127.0.0.1"
+	web.BConfig.Listen.HTTPPort = port
+
+	// 2. 初始化 SQLite。两个实例共用同一个数据库文件。
+	dbPath := web.AppConfig.DefaultString(
+		"sqlite_path",
+		"data/live-stream.db",
+	)
+	if err := storage.InitSQLite(dbPath); err != nil {
+		log.Fatalf("初始化数据库失败: %v", err)
+	}
+	log.Printf("SQLite 初始化成功，数据库路径：%s", dbPath)
+
+	if err := storage.InitSchema(); err != nil {
+		log.Fatalf("初始化表结构失败: %v", err)
+	}
+	log.Println("数据库表结构初始化成功")
+
+	// 3. 初始化 Redis。
+	redisCfg := storage.RedisConfig{
+		Addr: web.AppConfig.DefaultString(
+			"redis_addr",
+			"127.0.0.1:16379",
+		),
+		Password: web.AppConfig.DefaultString(
+			"redis_password",
+			"",
+		),
+		DB: web.AppConfig.DefaultInt("redis_db", 0),
+	}
+	redisClient, err := storage.InitRedis(redisCfg)
 	if err != nil {
-		log.Fatalf("restore room like counts failed: %v", err)
+		log.Fatalf("初始化 Redis 失败: %v", err)
 	}
-	log.Printf("room like counts restored, rooms=%d", reconciledRooms)
-	go startLikeCountReconciler(ctx)
-	if err := kafka.InitKafkaProducer(); err != nil {
-		log.Fatalf("kafka producer init failed: %v", err)
-	}
+	defer redisClient.Close()
+	log.Printf("Redis 初始化成功，地址：%s", redisCfg.Addr)
 
-	defer kafka.Close()
+	// 4. 本地 Hub 管连接，RoomBus 负责跨实例事件分发。
 	hub := ws.NewHub()
-	go hub.Run()
-	if config.GlobalConfig.Danmaku.HotRanking.Enabled {
-		go hotrank.New(hub).Run(ctx)
+	roomBus := service.NewRoomBus(
+		redisClient,
+		hub,
+		instanceID,
+		[]string{"gw-a", "gw-b"},
+	)
+
+	// 先确认 Redis 订阅，再启动 HTTP 和 Kafka 消费任务。
+	subscribeCtx, subscribeCancel := context.WithTimeout(
+		context.Background(),
+		3*time.Second,
+	)
+	subscribeErr := roomBus.Open(subscribeCtx)
+	subscribeCancel()
+	if subscribeErr != nil {
+		log.Fatalf("初始化跨实例订阅失败: %v", subscribeErr)
 	}
-	diagnosticsServer := startDiagnosticsServer(hub)
-	go func() {
-		if err := ws.StartRedisSubscriber(ctx, hub); err != nil {
-			log.Printf("redis subscriber exit: %v", err)
+	defer roomBus.Close()
+
+	// 5. 每个实例创建自己的 Producer，使用相同的 Kafka。
+	kafkaBrokers := []string{"127.0.0.1:19092"}
+	danmaTopic := "live-danma"
+
+	producer := kafka.NewProducer(kafkaBrokers, danmaTopic)
+	defer func() {
+		if err := producer.Close(); err != nil {
+			log.Printf("lifecycle: kafka producer close: %v", err)
+		} else {
+			log.Println("lifecycle: kafka producer closed")
 		}
 	}()
 
-	go func() {
-		if err := kafka.StartKafkaConsumer(ctx); err != nil {
-			log.Printf("kafka persistence consumer exit: %v", err)
-		}
-	}()
-	go func() {
-		if err := kafka.StartRealtimeConsumer(ctx); err != nil {
-			log.Printf("kafka realtime consumer exit: %v", err)
-		}
-	}()
+	// 消费后的广播和保存 ACK 改走 RoomBus。
+	danmaPipeline := service.NewDanmaPipeline(
+		redisClient,
+		roomBus,
+		kafkaBrokers,
+		danmaTopic,
+	)
 
-	r := gin.Default()
-
-	rousters.SetUpRousters(r, hub)
-
-	// 服务协程启动gin
-	appServer := &http.Server{
-		Addr:              ":9000",
-		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	serverExit := make(chan struct{})
-	go func() {
-		defer close(serverExit)
-		err := appServer.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("gin server run err: %v", err)
-		}
-	}()
-
-	// 监听系统信号：Ctrl+C / kill
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	log.Println("receive shutdown signal, start exit")
-
-	// 通知所有协程退出
-	cancel()
-	hub.Stop()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := appServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown application server: %v", err)
-	}
-	if err := diagnosticsServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown diagnostics server: %v", err)
+	// 6. 仅 A 刷新共享榜单，使用两个实例汇总的在线数。
+	var hotRanking *service.HotRanking
+	if instanceID == "gw-a" {
+		hotRanking = service.NewHotRanking(
+			redisClient,
+			roomBus.SnapshotOnlineCounts,
+		)
 	}
 
-	// 等待gin服务退出
-	<-serverExit
-	log.Println("service exited")
-}
+	// 7. 注册路由，注入 RoomBus。
+	secureCookie := web.AppConfig.DefaultBool("cookie_secure", false)
+	routers.Register(
+		redisClient,
+		secureCookie,
+		hub,
+		producer,
+		roomBus,
+	)
+	log.Println("路由注册成功")
 
-func startLikeCountReconciler(ctx context.Context) {
-	intervalSeconds := 30
-	if config.GlobalConfig != nil && config.GlobalConfig.Danmaku.Like.ReconcileIntervalSeconds > 0 {
-		intervalSeconds = config.GlobalConfig.Danmaku.Like.ReconcileIntervalSeconds
-	}
-	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if _, err := dao.ReconcileRoomLikeCounts(ctx, false); err != nil {
-				log.Printf("reconcile room like counts failed: %v", err)
-			}
-		}
-	}
-}
+	// 8. 生命周期启动后台任务，并负责退出清理。
+	web.BConfig.Listen.Graceful = true
+	grace.DefaultTimeout = 15 * time.Second
+	web.BeeApp.LifeCycleCallbacks = append(
+		web.BeeApp.LifeCycleCallbacks,
+		lifecycle.NewWeb(hub, hotRanking, danmaPipeline, roomBus),
+	)
 
-func startDiagnosticsServer(hub *ws.Hub) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	mux.Handle("/debug/ws/metrics", hub.MetricsHandler())
-	mux.Handle("/debug/kafka/realtime", kafka.RealtimeMetricsHandler())
-
-	server := &http.Server{
-		Addr:              "127.0.0.1:6060",
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	go func() {
-		log.Printf("diagnostics server listening on %s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("diagnostics server exit: %v", err)
-		}
-	}()
-	return server
+	log.Printf("starting backend on 127.0.0.1:%d", port)
+	web.Run()
+	log.Println("lifecycle: HTTP server run finished")
 }
